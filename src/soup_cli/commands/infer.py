@@ -100,9 +100,10 @@ def infer(
         "text",
         "--task",
         help=(
-            "Inference task: 'text' (default, chat generation) or 'asr' "
+            "Inference task: 'text' (default, chat generation), 'asr' "
             "(Whisper transcription; input rows are {\"audio\": path[, "
-            "\"text\": reference]})."
+            "\"text\": reference]}) or 'vision' (image-text-to-text; input rows "
+            "are {\"prompt\": text, \"images\": [paths]} or {\"content\": [...]})."
         ),
     ),
     asr_language: Optional[str] = typer.Option(
@@ -120,6 +121,15 @@ def infer(
         "--audio-dir",
         help=(
             "Base directory audio paths in --input must stay under (--task asr; "
+            "defaults to the --input file's directory). Traversal / UNC paths "
+            "are rejected."
+        ),
+    ),
+    image_dir: Optional[str] = typer.Option(
+        None,
+        "--image-dir",
+        help=(
+            "Base directory image paths in --input must stay under (--task vision; "
             "defaults to the --input file's directory). Traversal / UNC paths "
             "are rejected."
         ),
@@ -197,8 +207,29 @@ def infer(
             audio_dir=audio_dir,
         )
         return
+    # Image-text-to-text branch: rows carry images next to the prompt. Like ASR it
+    # diverts before the chat model-resolution path; _infer_vision owns its load.
+    if task == "vision":
+        if cuda_graphs is True:
+            raise typer.BadParameter(
+                "--cuda-graphs supports text generation only. Omit --cuda-graphs for --task vision"
+            )
+        _infer_vision(
+            model=model,
+            base=base,
+            input_file=input_file,
+            device=device,
+            output_file=output_file,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            trust_remote_code=trust_remote_code,
+            image_dir=image_dir,
+        )
+        return
     if task != "text":
-        console.print(f"[red]Unknown --task {task!r}; expected 'text' or 'asr'.[/]")
+        console.print(
+            f"[red]Unknown --task {task!r}; expected 'text', 'asr' or 'vision'.[/]"
+        )
         raise typer.Exit(2)
 
     # Resolve model: local path or HF repo id (auto-fallback, #N7).
@@ -378,30 +409,36 @@ def _read_asr_rows(path: Path) -> list[dict]:
     return rows
 
 
-def _resolve_asr_audio(audio: str, base_dir: Path) -> str:
-    """Resolve a row's audio path against ``base_dir`` with containment.
+def _resolve_media_path(value: str, base_dir: Path, label: str) -> str:
+    """Resolve a row's media path against ``base_dir`` with containment.
 
     Rejects UNC / network paths and anything that resolves outside
     ``base_dir`` (realpath + commonpath) — the infer path is fed JSONL the
     operator may not have authored (the training path already enforces this
     via ``_validate_audio_files``). Raises ``ValueError`` on rejection.
+    ``label`` ("audio" / "image") only words the error messages.
     """
     from soup_cli.utils.paths import is_under
 
-    if "\x00" in audio:
-        raise ValueError("audio path must not contain null bytes")
+    if "\x00" in value:
+        raise ValueError(f"{label} path must not contain null bytes")
     # UNC (\\host\share) / network (//host) paths trigger outbound SMB on
     # Windows — reject before any filesystem touch.
-    if audio.startswith(("\\\\", "//")):
-        raise ValueError("audio path must not be a UNC / network path")
-    candidate = Path(audio)
+    if value.startswith(("\\\\", "//")):
+        raise ValueError(f"{label} path must not be a UNC / network path")
+    candidate = Path(value)
     if not candidate.is_absolute():
         candidate = base_dir / candidate
     if not is_under(candidate, base_dir):
         raise ValueError(
-            f"audio path {Path(audio).name!r} must stay under the audio dir"
+            f"{label} path {Path(value).name!r} must stay under the {label} dir"
         )
     return str(candidate)
+
+
+def _resolve_asr_audio(audio: str, base_dir: Path) -> str:
+    """Resolve a row's audio path against ``base_dir`` with containment."""
+    return _resolve_media_path(audio, base_dir, "audio")
 
 
 def _resolve_asr_gen_prefix(
@@ -633,6 +670,310 @@ def _infer_asr(
     if refs:
         summary += f"\nCorpus WER: [bold]{corpus_wer(refs, hyps):.3f}[/]"
     console.print(Panel(summary, title="[bold green]ASR Complete![/]"))
+
+
+# Test seam for ``--task vision``: when set to ``callable(parts) -> str`` (parts =
+# list of ``("text", str) | ("image", resolved_path)``) it replaces the real
+# image-text-to-text model, so the vision path is unit-testable without a download.
+_VISION_GENERATOR_OVERRIDE = None
+
+# Cap on vision batch rows / images per row — each row decodes images and runs a
+# full generate(), so an unbounded --input is a resource-exhaustion vector.
+_MAX_VISION_ROWS: int = 100_000
+_MAX_IMAGES_PER_ROW: int = 32
+
+
+def _vision_parts(row: object) -> list[tuple[str, str]] | None:
+    """Normalise a vision row to ``[("text", str) | ("image", path), ...]``.
+
+    Two row shapes are accepted:
+
+    * ``{"prompt": str, "images": [path, ...]}`` — the text first, then every image
+      in order (images optional);
+    * ``{"content": [{"type": "text", "text": str}, {"type": "image", "image":
+      path}, ...]}`` — explicit interleaving, order preserved.
+
+    Returns ``None`` for a row that is neither (so the reader can drop it).
+    """
+    if not isinstance(row, dict):
+        return None
+    parts: list[tuple[str, str]] = []
+    content = row.get("content")
+    if content is not None:
+        if not isinstance(content, list) or not content:
+            return None
+        for item in content:
+            if not isinstance(item, dict):
+                return None
+            kind = item.get("type")
+            if kind == "text" and isinstance(item.get("text"), str):
+                parts.append(("text", item["text"]))
+            elif (
+                kind == "image"
+                and isinstance(item.get("image"), str)
+                and item["image"].strip()
+            ):
+                parts.append(("image", item["image"]))
+            else:
+                return None
+    else:
+        prompt = row.get("prompt")
+        images = row.get("images", [])
+        if not isinstance(prompt, str) or not prompt.strip():
+            return None
+        if not isinstance(images, list):
+            return None
+        parts.append(("text", prompt))
+        for image in images:
+            if not isinstance(image, str) or not image.strip():
+                return None
+            parts.append(("image", image))
+    n_images = sum(1 for kind, _ in parts if kind == "image")
+    if n_images > _MAX_IMAGES_PER_ROW:
+        return None
+    return parts
+
+
+def _read_vision_rows(path: Path) -> list[dict]:
+    """Read vision rows (see :func:`_vision_parts`) from JSONL.
+
+    Malformed rows are dropped (a warning is printed once). Capped at
+    ``_MAX_VISION_ROWS``.
+    """
+    rows: list[dict] = []
+    dropped = 0
+    capped = False
+    with open(path, encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                dropped += 1
+                continue
+            if _vision_parts(obj) is None:
+                dropped += 1
+                continue
+            rows.append(obj)
+            if len(rows) >= _MAX_VISION_ROWS:
+                capped = True
+                break
+    if dropped:
+        console.print(
+            f"[yellow]Skipped {dropped} row(s) with no usable 'prompt'+'images' "
+            "or 'content'.[/]"
+        )
+    if capped:
+        console.print(
+            f"[yellow]Capped at {_MAX_VISION_ROWS} rows; remaining input ignored.[/]"
+        )
+    return rows
+
+
+def _build_vision_generator(
+    model: str,
+    base: Optional[str],
+    device: Optional[str],
+    max_tokens: int,
+    temperature: float,
+    trust_remote_code: bool,
+) -> Callable[[list[tuple[str, str]]], str]:
+    """Build a ``generate(parts) -> str`` closure over an image-text-to-text model.
+
+    Loads ``AutoModelForImageTextToText`` + ``AutoProcessor`` from a full model
+    directory / Hub id, or from a PEFT/LoRA adapter dir (base resolved from
+    ``--base`` or the adapter's ``base_model_name_or_path``). The processor's own
+    chat template renders the turn; each image becomes an ``{"type": "image"}``
+    slot, in the order of ``parts``. Greedy when ``temperature`` is 0.
+    """
+    if not device:
+        from soup_cli.utils.gpu import detect_device
+
+        device, _ = detect_device()
+
+    from soup_cli.utils.gpu import resolve_inference_device_map_and_dtype
+    from soup_cli.utils.trust_remote import (
+        model_requires_trust_remote_code,
+        resolve_trust_remote_code,
+    )
+
+    model_path = Path(model)
+    adapter_cfg = model_path / "adapter_config.json"
+    is_adapter = adapter_cfg.exists()
+    base_ref = base
+    if is_adapter and not base_ref:
+        try:
+            with open(adapter_cfg, encoding="utf-8") as fh:
+                base_ref = json.load(fh).get("base_model_name_or_path")
+        except (json.JSONDecodeError, OSError):
+            base_ref = None
+        if not base_ref:
+            console.print(
+                f"[red]Cannot detect base model for adapter {model_path}; "
+                "pass --base.[/]"
+            )
+            raise typer.Exit(1)
+
+    weights_ref = base_ref if is_adapter else model
+    requires = model_requires_trust_remote_code(weights_ref) or False
+    resolved_trust = resolve_trust_remote_code(
+        weights_ref, requested=trust_remote_code, console=console,
+        requires_remote_code=requires,
+    )
+
+    import torch
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    device_map, torch_dtype = resolve_inference_device_map_and_dtype(device)
+    # Vision-language checkpoints are released and fine-tuned in bf16; fp16 can
+    # overflow in their vision towers, so prefer bf16 where the GPU has it.
+    if str(device).lower().startswith("cuda") and torch.cuda.is_bf16_supported():
+        torch_dtype = torch.bfloat16
+
+    console.print(f"[dim]Loading vision-language model: {model}[/]")
+    processor = AutoProcessor.from_pretrained(
+        weights_ref, trust_remote_code=resolved_trust
+    )
+    vlm = AutoModelForImageTextToText.from_pretrained(
+        weights_ref, torch_dtype=torch_dtype, device_map=device_map,
+        trust_remote_code=resolved_trust,
+    )
+    if is_adapter:
+        from peft import PeftModel
+
+        vlm = PeftModel.from_pretrained(vlm, model)
+    vlm.eval()
+
+    gen_kwargs: dict = {"max_new_tokens": max_tokens}
+    if temperature and temperature > 0:
+        gen_kwargs.update(do_sample=True, temperature=temperature)
+    else:
+        gen_kwargs.update(do_sample=False, temperature=None, top_p=None, top_k=None)
+
+    def generate(parts: list[tuple[str, str]]) -> str:
+        from PIL import Image
+
+        content: list[dict] = []
+        images = []
+        for kind, value in parts:
+            if kind == "text":
+                content.append({"type": "text", "text": value})
+            else:
+                with Image.open(value) as img:
+                    images.append(img.convert("RGB"))
+                content.append({"type": "image"})
+        chat = processor.apply_chat_template(
+            [{"role": "user", "content": content}],
+            add_generation_prompt=True, tokenize=False,
+        )
+        enc = processor(
+            text=[chat], images=images or None, return_tensors="pt"
+        ).to(vlm.device)
+        with torch.no_grad():
+            out = vlm.generate(**enc, **gen_kwargs)
+        new_tokens = out[0, enc["input_ids"].shape[1]:]
+        tokenizer = getattr(processor, "tokenizer", processor)
+        return tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+    return generate
+
+
+def _infer_vision(
+    *,
+    model: str,
+    base: Optional[str],
+    input_file: str,
+    device: Optional[str],
+    output_file: str,
+    max_tokens: int,
+    temperature: float,
+    trust_remote_code: bool,
+    image_dir: Optional[str] = None,
+) -> None:
+    """Generate for a vision JSONL input (image-text-to-text) and write JSONL."""
+    from soup_cli.utils.paths import (
+        atomic_write_text,
+        enforce_under_cwd_and_no_symlink,
+        is_under_cwd,
+    )
+
+    try:
+        enforce_under_cwd_and_no_symlink(output_file, "--output")
+    except (TypeError, ValueError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+
+    # Image containment base: --image-dir (must be under cwd) or the input's dir.
+    if image_dir:
+        if not is_under_cwd(image_dir):
+            console.print("[red]--image-dir must stay under the cwd.[/]")
+            raise typer.Exit(1)
+        base_dir = Path(image_dir).resolve()
+    else:
+        base_dir = Path(input_file).resolve().parent
+
+    rows = _read_vision_rows(Path(input_file))
+    if not rows:
+        console.print(
+            "[red]No vision rows found (need {\"prompt\": ..., \"images\": [...]} "
+            "or {\"content\": [...]} JSONL).[/]"
+        )
+        raise typer.Exit(1)
+
+    if _VISION_GENERATOR_OVERRIDE is not None:
+        generate = _VISION_GENERATOR_OVERRIDE
+    else:
+        try:
+            generate = _build_vision_generator(
+                model, base, device, max_tokens, temperature, trust_remote_code,
+            )
+        except ImportError as exc:
+            console.print(f"[red]{exc}[/]")
+            raise typer.Exit(1) from exc
+        except (ValueError, OSError) as exc:  # not a vision model / bad base
+            console.print(f"[red]{for_terminal(str(exc))}[/]")
+            raise typer.Exit(2) from exc
+
+    out_lines: list[str] = []
+    skipped = 0
+    for index, row in enumerate(rows):
+        parts = _vision_parts(row)
+        try:
+            resolved = [
+                (kind, _resolve_media_path(value, base_dir, "image")
+                 if kind == "image" else value)
+                for kind, value in parts
+            ]
+            started = time.perf_counter()
+            response = generate(resolved)
+            seconds = round(time.perf_counter() - started, 3)
+        except (ValueError, OSError, ImportError) as exc:
+            skipped += 1
+            console.print(
+                f"[yellow]Skipped row {index}: {for_terminal(str(exc))}[/]"
+            )
+            continue
+        rec = {k: row[k] for k in ("prompt", "images", "content") if k in row}
+        rec["response"] = response
+        rec["seconds"] = seconds
+        out_lines.append(json.dumps(rec, ensure_ascii=False))
+
+    # All rows failed — do not write an empty file and claim success.
+    if not out_lines:
+        console.print(
+            f"[red]No rows generated ({skipped} skipped). "
+            "Check --image-dir and the input image paths.[/]"
+        )
+        raise typer.Exit(2)
+
+    atomic_write_text("\n".join(out_lines) + "\n", output_file, field="--output")
+
+    summary = f"Generated [bold]{len(out_lines)}[/] row(s) -> {output_file}"
+    if skipped:
+        summary += f"  ([yellow]{skipped} skipped[/])"
+    console.print(Panel(summary, title="[bold green]Vision Inference Complete![/]"))
 
 
 def _read_prompts(path: Path) -> list[str]:

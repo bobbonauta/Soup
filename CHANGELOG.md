@@ -12,6 +12,10 @@ reproducing 70+ versions of notes.
 
 ## [Unreleased]
 
+### Added
+
+- `soup infer --task vision` runs image-text-to-text generation from a JSONL of `{"prompt", "images"}` or interleaved `{"content"}` rows, for a full vision-language model or a PEFT adapter (`AutoModelForImageTextToText` + `AutoProcessor`, the processor's own chat template, greedy at temperature 0). Image paths follow the same containment as `--audio-dir` (new `--image-dir`; UNC/traversal rejected). Previously `infer` / `serve` / `chat` had no image input: vision was reachable only through training.
+
 ## [0.75.1] - 2026-09-21
 
 ### Fixed

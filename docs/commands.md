@@ -31,6 +31,7 @@ soup train --config soup.yaml --cloud modal|lambda --gpu a100  Render a cloud GP
 soup infer --model ./output --input p.jsonl   Batch inference
 soup infer --model ./output --input p.jsonl --cuda-graphs   Experimental CUDA graph decode (Qwen2/Llama, one GPU, PyTorch >= 2.14)
 soup infer --task asr --model <whisper|adapter> --input a.jsonl --output o.jsonl [--audio-dir d --asr-language en --asr-task transcribe|translate]  Whisper transcription + WER/CER
+soup infer --task vision --model <vlm|adapter> --input v.jsonl --output o.jsonl [--image-dir d --base b]  Image-text-to-text generation (rows: {"prompt": ..., "images": [...]} or {"content": [{"type": "text"|"image", ...}]}; images contained under --image-dir; needs the model's processor deps, e.g. torchvision for Qwen3-VL)
 soup chat --model ./output                    Interactive chat
 soup infer|chat|diff ... --device cpu|cuda|cuda:N|mps  Pick where the model loads (see below)
 soup push --model ./output --repo user/name   Upload to HuggingFace
