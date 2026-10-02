@@ -130,6 +130,21 @@ class TestInferVision:
             ("image", str(tmp_path.resolve() / "b.png")),
         ]
 
+    def test_id_is_echoed_back_for_joins(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(infer_mod, "_VISION_GENERATOR_OVERRIDE", lambda parts: "ok")
+        _write_rows(tmp_path / "in.jsonl", [
+            {"id": "case-7", "prompt": "p", "images": ["a.png"]},
+            {"id": "case-9", "prompt": "p", "images": ["../evil.png"]},
+        ])
+        monkeypatch.chdir(tmp_path)
+        infer_mod._infer_vision(
+            model="x", base=None, input_file="in.jsonl", device="cpu",
+            output_file="out.jsonl", max_tokens=8, temperature=0.0,
+            trust_remote_code=False,
+        )
+        out = _read_out(tmp_path / "out.jsonl")
+        assert [o["id"] for o in out] == ["case-7"]
+
     def test_image_dir_is_the_containment_base(self, tmp_path, monkeypatch):
         (tmp_path / "imgs").mkdir()
         seen = []

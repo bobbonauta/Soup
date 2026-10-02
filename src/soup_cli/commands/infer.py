@@ -955,7 +955,8 @@ def _infer_vision(
                 f"[yellow]Skipped row {index}: {for_terminal(str(exc))}[/]"
             )
             continue
-        rec = {k: row[k] for k in ("prompt", "images", "content") if k in row}
+        # An optional "id" is echoed back so callers can join results without relying on row order.
+        rec = {k: row[k] for k in ("id", "prompt", "images", "content") if k in row}
         rec["response"] = response
         rec["seconds"] = seconds
         out_lines.append(json.dumps(rec, ensure_ascii=False))
